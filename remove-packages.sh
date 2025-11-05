@@ -4,7 +4,7 @@ set -euo pipefail
 # remove-packages.sh — removes all packages listed in removed-packages.list
 # Usage: sudo ./remove-packages.sh
 
-LIST="./removed-packages.list"
+LIST="./packages.list"
 
 if [[ ! -f "$LIST" ]]; then
   echo "Error: $LIST not found."
