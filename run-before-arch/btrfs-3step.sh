@@ -5,8 +5,8 @@
 # HOW TO USE THIS SCRIPT (Arch ISO + Btrfs 3-step: partition -> format -> layout)
 # ==============================================================================
 # Summary:
-#   Prepare a disk for an Arch install with a minimal Btrfs layout.
-#   Subvols: @ (root), @home, @log, @cache, @snapshots
+#   Prepare a disk for an Arch install with Archinstall-style Btrfs subvols.
+#   Subvols: @ (root), @home, @log, @pkg
 #   Mounts to /mnt so you can use archinstall Manual.
 #
 # Assumptions:
@@ -143,7 +143,8 @@ print_mounts() {
 make_dirs() {
   mkdir -p /mnt
   mkdir -p /mnt/btrfs-root
-  mkdir -p /mnt/{home,var/log,var/cache,.snapshots,boot}
+  mkdir -p /mnt/{home,var/log,var/cache,boot}
+  mkdir -p /mnt/var/cache/pacman/pkg
 }
 
 # Parse args
@@ -253,7 +254,7 @@ do_layout() {
     echo "Btrfs label detected: $label"
   fi
 
-  # Create subvolumes idempotently
+  # Create subvolumes idempotently (Archinstall defaults)
   create_sv() {
     local name="$1"
     if btrfs subvolume show "/mnt/btrfs-root/$name" >/dev/null 2>&1; then
@@ -267,8 +268,7 @@ do_layout() {
   create_sv "@"
   create_sv "@home"
   create_sv "@log"
-  create_sv "@cache"
-  create_sv "@snapshots"
+  create_sv "@pkg"
 
   umount /mnt/btrfs-root
 
@@ -277,13 +277,13 @@ do_layout() {
   echo "Mounting subvol=@ to /mnt"
   mount -o "subvol=@,${mopts}" "$BTRFS_PART" /mnt
 
-  mkdir -p /mnt/{home,var/log,var/cache,.snapshots,boot}
+  mkdir -p /mnt/{home,var/log,var/cache,boot}
+  mkdir -p /mnt/var/cache/pacman/pkg
 
   echo "Mounting subvols..."
-  mount -o "subvol=@home,${mopts}"      "$BTRFS_PART" /mnt/home
-  mount -o "subvol=@log,${mopts}"       "$BTRFS_PART" /mnt/var/log
-  mount -o "subvol=@cache,${mopts}"     "$BTRFS_PART" /mnt/var/cache
-  mount -o "subvol=@snapshots,${mopts}" "$BTRFS_PART" /mnt/.snapshots
+  mount -o "subvol=@home,${mopts}" "$BTRFS_PART" /mnt/home
+  mount -o "subvol=@log,${mopts}"  "$BTRFS_PART" /mnt/var/log
+  mount -o "subvol=@pkg,${mopts}"  "$BTRFS_PART" /mnt/var/cache/pacman/pkg
 
   echo "Mounting EFI to /mnt/boot"
   mount "$EFI_PART" /mnt/boot
