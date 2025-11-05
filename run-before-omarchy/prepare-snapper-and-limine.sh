@@ -99,7 +99,7 @@ fi
 ln -sfn "$ROOT_CFG" /.snapshots/config
 
 # Verify Snapper sees the config (no create-config anywhere)
-if ! snapper_sees_root; then
+if ! snapper list-configs 2>/dev/null | grep -Eq '^[[:space:]]*root[[:space:]]*\|' ; then
   # Helpful diagnostics before failing
   snapper list-configs || true
   ls -l /etc/snapper/configs /etc/snapper/configs/root /.snapshots /.snapshots/config || true
