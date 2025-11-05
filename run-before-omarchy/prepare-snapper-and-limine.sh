@@ -103,4 +103,37 @@ if ! snapper_sees_root; then
   # Helpful diagnostics before failing
   snapper list-configs || true
   ls -l /etc/snapper/configs /etc/snapper/configs/root /.snapshots /.snapshots/config || true
-  findmnt -R -no TARGET,SOURCE,FSTYPE,OPTIONS /
+  findmnt -R -no TARGET,SOURCE,FSTYPE,OPTIONS / /.snapshots || true
+  die "Snapper did not recognize the 'root' config."
+fi
+
+log "Enabling Snapper timers"
+systemctl enable --now snapper-timeline.timer snapper-cleanup.timer >/dev/null
+
+# Ensure at least one root snapshot exists
+if ! snapper -c root list 2>/dev/null | awk 'NR>2{ok=1} END{exit !ok}'; then
+  log "Creating initial root snapshot"
+  snapper -c root create -d "Initial snapshot" >/dev/null
+fi
+
+# Configure limine-snapper-sync with subvolume paths
+if have limine-snapper-sync; then
+  log "Configuring limine-snapper-sync and generating Limine entries"
+  SNAP_SRC_RAW="$(findmnt -o SOURCE -n /.snapshots || true)"   # e.g. /dev/nvme0n1p2[/@snapshots]
+  SNAP_SUBVOL_BRACKET="$(sed -n 's/.*\[\(.*\)\].*/\1/p' <<<"$SNAP_SRC_RAW")"
+  [[ -z "$SNAP_SUBVOL_BRACKET" ]] && SNAP_SUBVOL_BRACKET="/@snapshots"
+  cat > /etc/limine-snapper-sync.conf <<EOF
+ROOT_SUBVOLUME_PATH="${ROOT_SUBVOL_BRACKET}"
+ROOT_SNAPSHOTS_PATH="${SNAP_SUBVOL_BRACKET}"
+ENTRY_PREFIX="Omarchy Snapshot"
+EOF
+  limine-snapper-sync >/dev/null || true
+else
+  log "limine-snapper-sync not available; skipping Limine entry generation"
+fi
+
+log "Done"
+echo "Check:"
+echo "  snapper list-configs     # should show: root | /"
+echo "  snapper -c root list     # should list snapshots"
+echo "  grep -i snapshot /boot/limine.cfg || true"
