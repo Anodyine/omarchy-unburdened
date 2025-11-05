@@ -1,11 +1,9 @@
 #!/usr/bin/env bash
-# prepare-snapper-minimal.sh
-# Simple idempotent setup for Btrfs + Snapper + optional Limine integration.
-# Run as root after Archinstall (root fs = btrfs, mounted at /).
+# prepare-snapper-minimal-fixed.sh
+# Minimal Snapper + Btrfs setup (manual config registration)
 
 set -euo pipefail
-
-ROOT_DEV="/dev/nvme0n1p2"     # <-- change if your root partition differs
+ROOT_DEV="/dev/nvme0n1p2"   # <-- change if different
 COMP_OPT="compress=zstd"
 
 log(){ printf '\n==> %s\n' "$*"; }
@@ -33,9 +31,10 @@ grep -q 'subvol=@snapshots' /etc/fstab || echo "$FSTAB_LINE" >> /etc/fstab
 mountpoint -q /.snapshots || mount /.snapshots
 
 # ---------------------------------------------------------------------------
-# 2. Minimal snapper config
+# 2. Register minimal snapper config
 # ---------------------------------------------------------------------------
-log "Creating minimal snapper config"
+log "Creating and registering snapper config"
+
 mkdir -p /etc/snapper/configs
 cat > /etc/snapper/configs/root <<'EOF'
 SUBVOLUME="/"
@@ -44,15 +43,19 @@ TIMELINE_CREATE="yes"
 TIMELINE_CLEANUP="yes"
 NUMBER_CLEANUP="yes"
 EOF
-
 chmod 600 /etc/snapper/configs/root
+
+# Register it manually with Snapper’s system list
+grep -q '^root$' /etc/snapper/configs 2>/dev/null || echo "root" >> /etc/snapper/configs
+
+# Link config into /.snapshots
 ln -sf /etc/snapper/configs/root /.snapshots/config
 
 # ---------------------------------------------------------------------------
-# 3. Verify snapper and seed initial snapshot
+# 3. Verify and seed
 # ---------------------------------------------------------------------------
 log "Verifying snapper config"
-snapper -c root get-config || { echo "Snapper config invalid"; exit 1; }
+snapper -c root get-config
 
 log "Enabling snapper timers"
 systemctl enable --now snapper-timeline.timer snapper-cleanup.timer >/dev/null
@@ -63,7 +66,7 @@ if ! snapper -c root list 2>/dev/null | awk 'NR>2{ok=1}END{exit!ok}'; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Optional: limine-snapper-sync
+# 4. Optional limine integration
 # ---------------------------------------------------------------------------
 if command -v limine-snapper-sync >/dev/null 2>&1; then
   log "Configuring limine-snapper-sync"
@@ -80,6 +83,6 @@ fi
 log "Done!"
 echo
 echo "Check:"
+echo "  snapper list-configs"
 echo "  snapper -c root get-config"
 echo "  snapper -c root list"
-echo "  grep -i snapshot /boot/limine.cfg || true"
