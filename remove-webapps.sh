@@ -2,104 +2,76 @@
 set -euo pipefail
 
 APPS_USER="$HOME/.local/share/applications"
-MODE="dry"       # default: dry-run
+OMARCHY_LOCAL="$HOME/.local/share/omarchy/applications"
+MODE="dry"
 BACKUP=false
 
-usage() {
-  echo "Usage: $0 [--apply] [--backup] <remove-webapps.list>"
-  exit 1
-}
+usage(){ echo "Usage: $0 [--apply] [--backup] <remove-webapps.list>"; exit 1; }
 
-# Parse flags
-args=()
-for a in "$@"; do
-  case "$a" in
-    --apply) MODE="apply" ;;
-    --backup) BACKUP=true ;;
-    -h|--help) usage ;;
-    *) args+=("$a") ;;
-  esac
-done
-set -- "${args[@]}"
-
+# parse flags
+args=(); for a in "$@"; do
+  case "$a" in --apply) MODE="apply";; --backup) BACKUP=true;; -h|--help) usage;; *) args+=("$a");; esac
+done; set -- "${args[@]}"
 [[ $# -eq 1 ]] || usage
-LIST="$1"
-[[ -f "$LIST" ]] || { echo "Missing list file: $LIST"; exit 1; }
+LIST="$1"; [[ -f "$LIST" ]] || { echo "Missing list file: $LIST"; exit 1; }
 
-# Normalize: lowercase, strip spaces and .desktop
-norm() { echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[[:space:]]+//g; s/\.desktop$//'; }
+norm(){ echo "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[[:space:]]+//g; s/\.desktop$//'; }
 
-# Load targets (normalized), skip anything that normalizes to empty
 declare -A targets=()
 while IFS= read -r line; do
   [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
-  key="$(norm "$line")"
-  [[ -n "$key" ]] && targets["$key"]=1
+  k="$(norm "$line")"; [[ -n "$k" ]] && targets["$k"]=1
 done < "$LIST"
 
-echo "[INFO] Targets:"
-for k in "${!targets[@]}"; do
-  echo "  - $k"
-done
-echo
+echo "[INFO] Targets:"; for k in "${!targets[@]}"; do echo "  - $k"; done; echo
 
-# Collect user .desktop files
-mapfile -t desks < <(find "$APPS_USER" -maxdepth 1 -type f -name '*.desktop' 2>/dev/null || true)
-
-to_remove=()
-for f in "${desks[@]}"; do
-  base="$(basename "$f")"
-  base_no_ext="${base%.desktop}"
+# collect user .desktop webapps
+mapfile -t desks_user < <(find "$APPS_USER" -maxdepth 1 -type f -name '*.desktop' 2>/dev/null || true)
+to_rm_user=()
+for f in "${desks_user[@]}"; do
+  base_no_ext="${f##*/}"; base_no_ext="${base_no_ext%.desktop}"
   nb="$(norm "$base_no_ext")"
-
-  # Name= (first)
   name_line="$(sed -n 's/^Name=\(.*\)$/\1/p' "$f" | head -n1 | tr -d '\r' || true)"
   nn="$(norm "$name_line")"
-
-  # Exec=
   exec_line="$(sed -n 's/^Exec=\(.*\)$/\1/p' "$f" | head -n1 | tr -d '\r' || true)"
-
-  match=false
-  if [[ -n "$nb" && -n "${targets[$nb]+x}" ]]; then match=true; fi
-  if [[ -n "$nn" && -n "${targets[$nn]+x}" ]]; then match=true; fi
-
-  looks_web=false
-  if echo "$exec_line" | grep -qiE '(^|[[:space:]])(https?://|--app=)'; then
-    looks_web=true
-  fi
-
-  if $match && $looks_web; then
-    to_remove+=("$f")
-  fi
+  match=false; [[ -n "$nb" && -n "${targets[$nb]+x}" ]] && match=true
+  [[ -n "$nn" && -n "${targets[$nn]+x}" ]] && match=true
+  looks_web=false; echo "$exec_line" | grep -qiE '(^|[[:space:]])(https?://|--app=)' && looks_web=true
+  if $match && $looks_web; then to_rm_user+=("$f"); fi
 done
+mapfile -t to_rm_user < <(printf "%s\n" "${to_rm_user[@]}" | sort -u)
 
-# Dedup
-mapfile -t to_remove < <(printf "%s\n" "${to_remove[@]}" | sort -u)
+# collect omarchy-local .desktop (exact filename match only, e.g., typora.desktop)
+to_rm_omarchy=()
+if [[ -d "$OMARCHY_LOCAL" ]]; then
+  mapfile -t desks_om < <(find "$OMARCHY_LOCAL" -maxdepth 1 -type f -name '*.desktop' 2>/dev/null || true)
+  for f in "${desks_om[@]}"; do
+    base_no_ext="${f##*/}"; base_no_ext="${base_no_ext%.desktop}"
+    nb="$(norm "$base_no_ext")"
+    if [[ -n "$nb" && -n "${targets[$nb]+x}" ]]; then to_rm_omarchy+=("$f"); fi
+  done
+  mapfile -t to_rm_omarchy < <(printf "%s\n" "${to_rm_omarchy[@]}" | sort -u)
+fi
 
-echo "[PLAN] Matched ${#to_remove[@]} .desktop file(s) in $APPS_USER:"
-printf '  %s\n' "${to_remove[@]:-}"
+echo "[PLAN] User webapp .desktop to remove: ${#to_rm_user[@]}"; printf '  %s\n' "${to_rm_user[@]:-}"
+echo "[PLAN] Omarchy-local .desktop to remove: ${#to_rm_omarchy[@]}"; printf '  %s\n' "${to_rm_omarchy[@]:-}"
 echo
 
 if [[ "$MODE" = "dry" ]]; then
-  echo "[DRY-RUN] No files will be deleted."
-  command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_USER" >/dev/null 2>&1 || true
-  exit 0
+  echo "[DRY-RUN] No files deleted."; command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_USER" >/dev/null 2>&1 || true; exit 0
 fi
 
-# Optional backup
-if $BACKUP && [[ ${#to_remove[@]} -gt 0 ]]; then
+if $BACKUP && { [[ ${#to_rm_user[@]} -gt 0 ]] || [[ ${#to_rm_omarchy[@]} -gt 0 ]]; }; then
   ts="$(date +%Y%m%d-%H%M%S)"
   out="$HOME/webapps-backup-$ts.tgz"
-  tar -C "$APPS_USER" -czf "$out" $(printf '%s\n' "${to_remove[@]}" | xargs -I{} basename "{}")
+  tar -czf "$out" \
+    $(printf '%s\n' "${to_rm_user[@]}"     | sed "s|^$APPS_USER/||" | xargs -r -I{} echo "-C" "$APPS_USER" "{}") \
+    $(printf '%s\n' "${to_rm_omarchy[@]}"  | sed "s|^$OMARCHY_LOCAL/||" | xargs -r -I{} echo "-C" "$OMARCHY_LOCAL" "{}") 2>/dev/null || true
   echo "[BACKUP] Saved to $out"
 fi
 
-# Remove files
-for f in "${to_remove[@]}"; do
-  rm -f -- "$f"
-done
-echo "[DONE] Removed ${#to_remove[@]} .desktop file(s)."
+for f in "${to_rm_user[@]}"; do rm -f -- "$f"; done
+for f in "${to_rm_omarchy[@]}"; do rm -f -- "$f"; done
 
-# Refresh desktop database for immediate launcher cleanup
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPS_USER" >/dev/null 2>&1 || true
-echo "[INFO] Launcher index refreshed."
+echo "[DONE] Removed ${#to_rm_user[@]} user entries and ${#to_rm_omarchy[@]} omarchy-local entries."
