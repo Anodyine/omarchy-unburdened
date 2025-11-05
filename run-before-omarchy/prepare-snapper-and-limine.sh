@@ -1,100 +1,111 @@
 #!/usr/bin/env bash
-# fix-snapper-layout-and-limine.sh
-# Align Archinstall-style Btrfs with Snapper's canonical layout:
-# - Root subvolume: /@  (mounted at /)
-# - Snapshots path:  /@/.snapshots  (not a separate @snapshots mount)
-# Then set up Snapper + limine-snapper-sync.
+# prepare-snapper-and-limine.sh
+# Idempotent setup for Btrfs + Snapper + Limine snapshot entries.
+# - Snapper SUBVOLUME="/" (snapper snapshots the mounted root fs)
+# - limine-snapper-sync uses subvolume paths from mounts:
+#     ROOT_SUBVOLUME_PATH = bracketed subvol for /
+#     ROOT_SNAPSHOTS_PATH = bracketed subvol for /.snapshots (e.g. /@snapshots)
+# Safe to re-run.
 
 set -euo pipefail
+
 log(){ printf '\n==> %s\n' "$*"; }
 die(){ echo "ERROR: $*" >&2; exit 1; }
 have(){ command -v "$1" >/dev/null 2>&1; }
+snapper_has_root(){ snapper list-configs 2>/dev/null | awk '$1=="root"{ok=1} END{exit !ok}'; }
 
 [[ $EUID -eq 0 ]] || die "Run as root"
+FSTYPE="$(findmnt -no FSTYPE / || true)"
+[[ "$FSTYPE" == "btrfs" ]] || die "Root filesystem is not btrfs"
 
-# Sanity: root on btrfs and find the block device for /
-[[ "$(findmnt -no FSTYPE /)" == "btrfs" ]] || die "Root filesystem is not btrfs"
+# Detect root device & bracketed subvol from /
 ROOT_SRC_RAW="$(findmnt -o SOURCE -n /)"          # e.g. /dev/nvme0n1p2[/@]
-ROOT_DEV="${ROOT_SRC_RAW%%[*}"                     # /dev/nvme0n1p2
-[[ -b "$ROOT_DEV" ]] || die "Could not resolve root block device"
+ROOT_SRC_DEV="${ROOT_SRC_RAW%%[*}"                 # -> /dev/nvme0n1p2
+ROOT_SUBVOL_BRACKET="$(sed -n 's/.*\[\(.*\)\].*/\1/p' <<<"$ROOT_SRC_RAW")"
+[[ -z "$ROOT_SUBVOL_BRACKET" ]] && ROOT_SUBVOL_BRACKET="/"
 
-# 1) If a separate /.snapshots mount exists, unmount it and remove its fstab line
-if findmnt -no SOURCE /.snapshots >/dev/null 2>&1; then
-  log "Unmounting existing /.snapshots mount so Snapper can own /@/.snapshots"
-  umount /.snapshots || true
+# Keep existing compress=... if present; else default to zstd
+ROOT_OPTS="$(findmnt -no OPTIONS / || true)"
+COMP_OPT="compress=zstd"
+if [[ "$ROOT_OPTS" =~ (compress=[^,[:space:]]+) ]]; then
+  COMP_OPT="${BASH_REMATCH[1]}"
+elif [[ "$ROOT_OPTS" =~ (compress-force=[^,[:space:]]+) ]]; then
+  COMP_OPT="${BASH_REMATCH[1]}"
 fi
 
-if [[ -f /etc/fstab ]]; then
-  # Remove any line that mounts btrfs on /.snapshots (conservative)
-  if grep -qE '^[^#]+\s+\/\.snapshots\s+btrfs' /etc/fstab; then
-    log "Removing stale /.snapshots btrfs mount from /etc/fstab"
-    cp -a /etc/fstab /etc/fstab.bak.$(date +%Y%m%d-%H%M%S)
-    awk '!($2=="/.snapshots" && $3=="btrfs")' /etc/fstab > /etc/fstab.new
-    mv /etc/fstab.new /etc/fstab
-  fi
-fi
-
-# Ensure /.snapshots exists as a plain directory in / (which is /@)
-mkdir -p /.snapshots
-chown root:root /.snapshots
-chmod 750 /.snapshots
-
-# 2) Packages
-log "Installing snapper and limine (if missing)"
+log "Installing required packages (btrfs-progs, snapper, limine)"
 pacman -Sy --needed --noconfirm btrfs-progs snapper limine >/dev/null
 
-# 3) Create a standard Snapper config for root (this creates /@/.snapshots as a subvolume)
-if ! snapper -c root get-config >/dev/null 2>&1; then
-  log "Creating Snapper config for / (this will create /@/.snapshots)"
-  # If a leftover config file or link exists, remove it so create-config can proceed cleanly
-  rm -f /etc/snapper/configs/root /.snapshots/config 2>/dev/null || true
-  snapper -c root create-config /    # canonical as per manual/ArchWiki
-fi
-
-# Harden config options (idempotent)
-CFG="/etc/snapper/configs/root"
-[[ -f "$CFG" ]] || die "Snapper root config missing after create-config"
-chmod 600 "$CFG"
-ensure_kv () {
-  local key="$1" val="$2"
-  if grep -q "^${key}=" "$CFG"; then
-    sed -i "s|^${key}=.*|${key}=\"${val}\"|" "$CFG"
-  else
-    printf '%s="%s"\n' "$key" "$val" >> "$CFG"
-  fi
-}
-ensure_kv FSTYPE "btrfs"
-ensure_kv TIMELINE_CREATE "yes"
-ensure_kv TIMELINE_CLEANUP "yes"
-ensure_kv NUMBER_CLEANUP "yes"
-
-# Re-link /.snapshots/config (snapper usually does this, make sure it exists)
-ln -sfn "$CFG" /.snapshots/config
-
-# Verify the canonical layout now works
-log "Verifying Snapper config with canonical layout"
-snapper -c root get-config >/dev/null 2>&1 || die "Snapper still does not recognize 'root'"
-
-# 4) Timers and initial snapshot
-log "Enabling snapper timers"
-systemctl enable --now snapper-timeline.timer snapper-cleanup.timer >/dev/null
-
-if ! snapper -c root list 2>/dev/null | awk 'NR>2{ok=1} END{exit !ok}'; then
-  log "Creating initial root snapshot"
-  snapper -c root create -d "Initial snapshot"
-fi
-
-# 5) limine-snapper-sync (defaults assume /@ and /@/.snapshots)
+# Try to install limine-snapper-sync (repo, else AUR if helper exists)
 if ! have limine-snapper-sync; then
   pacman -S --needed --noconfirm limine-snapper-sync >/dev/null 2>&1 || true
+  have yay  && ! have limine-snapper-sync && yay  -S --needed --noconfirm limine-snapper-sync || true
+  have paru && ! have limine-snapper-sync && paru -S --needed --noconfirm limine-snapper-sync || true
 fi
 
+# Ensure @snapshots exists at top-level and mount /.snapshots
+log "Ensuring @snapshots subvolume exists and /.snapshots is mounted"
+TMPMNT="/mnt/.btrfs-top"
+mkdir -p "$TMPMNT"
+mountpoint -q "$TMPMNT" || mount -o subvolid=5 "$ROOT_SRC_DEV" "$TMPMNT"
+[[ -d "$TMPMNT/@snapshots" ]] || btrfs subvolume create "$TMPMNT/@snapshots" >/dev/null
+umount "$TMPMNT" || true
+rmdir "$TMPMNT" || true
+
+mkdir -p /.snapshots
+ROOT_UUID="$(blkid -s UUID -o value "$ROOT_SRC_DEV" 2>/dev/null || true)"
+FSTAB_SRC="${ROOT_UUID:+UUID=$ROOT_UUID}"; FSTAB_SRC="${FSTAB_SRC:-$ROOT_SRC_DEV}"
+FSTAB_LINE="$FSTAB_SRC /.snapshots btrfs subvol=@snapshots,$COMP_OPT 0 0"
+grep -qE '^[^#]+\s+\/\.snapshots\s+btrfs\s+.*subvol=@snapshots' /etc/fstab 2>/dev/null || echo "$FSTAB_LINE" >> /etc/fstab
+mountpoint -q /.snapshots || mount /.snapshots
+
+# Detect the snapshots bracketed subvol from /.snapshots (e.g. /@snapshots)
+SNAP_SRC_RAW="$(findmnt -o SOURCE -n /.snapshots || true)"   # e.g. /dev/nvme0n1p2[/@snapshots]
+SNAP_SUBVOL_BRACKET="$(sed -n 's/.*\[\(.*\)\].*/\1/p' <<<"$SNAP_SRC_RAW")"
+[[ -z "$SNAP_SUBVOL_BRACKET" ]] && SNAP_SUBVOL_BRACKET="/@snapshots"
+
+# Create/normalize Snapper root config: IMPORTANT -> SUBVOLUME="/"
+log 'Ensuring Snapper root config exists (SUBVOLUME="/")'
+install -d -m 755 /etc/snapper/configs
+install -d -m 750 /.snapshots
+chown root:root /.snapshots
+
+ROOT_CFG="/etc/snapper/configs/root"
+cat > "$ROOT_CFG" <<'EOF'
+# snapper config for root (root subvolume is "/")
+SUBVOLUME="/"
+FSTYPE="btrfs"
+TIMELINE_CREATE="yes"
+TIMELINE_CLEANUP="yes"
+NUMBER_CLEANUP="yes"
+EOF
+chmod 600 "$ROOT_CFG"
+ln -sf "$ROOT_CFG" /.snapshots/config
+
+# Validate that snapper sees the 'root' config
+if ! snapper_has_root; then
+  SNAPPER_DEBUG=1 snapper list-configs 2>&1 | sed 's/^/SNAPPER_DEBUG: /'
+  ls -l /etc/snapper/configs | sed 's/^/CONFIGS: /'
+  ls -ld /.snapshots /.snapshots/config 2>/dev/null | sed 's/^/SNAPDIR: /'
+  die "Snapper did not recognize the 'root' config."
+fi
+
+# Enable Snapper timers
+log "Enabling Snapper timers"
+systemctl enable --now snapper-timeline.timer snapper-cleanup.timer >/dev/null
+
+# Ensure at least one root snapshot exists
+if ! snapper -c root list 2>/dev/null | awk 'NR>2{ok=1} END{exit !ok}'; then
+  log "Creating initial root snapshot"
+  snapper -c root create -d "Initial snapshot" >/dev/null
+fi
+
+# Configure limine-snapper-sync with subvolume *paths* (not mountpoints)
 if have limine-snapper-sync; then
-  log "Configuring limine-snapper-sync (defaults: /@ and /@/.snapshots)"
-  # You can omit the conf file, defaults match our layout. Write one explicitly for clarity:
-  cat > /etc/limine-snapper-sync.conf <<'EOF'
-ROOT_SUBVOLUME_PATH="/@"
-ROOT_SNAPSHOTS_PATH="/@/.snapshots"
+  log "Configuring limine-snapper-sync and generating Limine entries"
+  cat > /etc/limine-snapper-sync.conf <<EOF
+ROOT_SUBVOLUME_PATH="${ROOT_SUBVOL_BRACKET}"
+ROOT_SNAPSHOTS_PATH="${SNAP_SUBVOL_BRACKET}"
 ENTRY_PREFIX="Omarchy Snapshot"
 EOF
   limine-snapper-sync >/dev/null || true
@@ -104,7 +115,6 @@ fi
 
 log "Done"
 echo "Check:"
-echo "  snapper -c root get-config"
-echo "  snapper list-configs"
-echo "  snapper -c root list | head"
+echo "  snapper list-configs     # 'root' with Subvolume = /"
+echo "  snapper -c root list     # shows snapshots"
 echo "  grep -i snapshot /boot/limine.cfg || true"
